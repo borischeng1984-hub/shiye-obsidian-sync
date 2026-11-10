@@ -90,7 +90,8 @@ module.exports = class LeafSyncPlugin extends Plugin {
     this.settings = Object.assign({}, DEFAULTS, await this.loadData());
     this.settings.synced = this.settings.synced || {};
     this.running = false; this.again = false; this.timer = null;
-    this.addSettingTab(new LeafSyncSettings(this.app, this));
+    this.settingTab = new LeafSyncSettings(this.app, this);
+    this.addSettingTab(this.settingTab);
     this.addCommand({ id: 'sync-now', name: '立即同步到拾页', callback: () => this.sync(true) });
     this.addRibbonIcon('book-open', '同步到拾页', () => this.sync(true));
     const changed = file => { if (file instanceof TFile && this.watched(file)) this.schedule(); };
@@ -106,7 +107,10 @@ module.exports = class LeafSyncPlugin extends Plugin {
     this.registerInterval(window.setInterval(() => this.sync(false), 15 * 60 * 1000));
   }
   onunload() { clearTimeout(this.timer); }
-  configured() { return /^[\w.-]+\/[\w.-]+$/.test(this.settings.repo.replace(/^https?:\/\/github\.com\//, '').replace(/\.git$/, '')) && this.settings.token.trim(); }
+  configured() {
+    // iOS keyboards like to insert spaces after "-"; a repo name or token never contains whitespace.
+    this.settings.repo = this.settings.repo.replace(/\s+/g, ''); this.settings.token = this.settings.token.replace(/\s+/g, '');
+    return /^[\w.-]+\/[\w.-]+$/.test(this.settings.repo.replace(/^https?:\/\/github\.com\//, '').replace(/\.git$/, '')) && this.settings.token.trim(); }
   folders() { return this.settings.folders.split(/[,，\n]/).map(f => normalizePath(f.trim())).filter(f => f && f !== '/'); }
   watched(file) {
     if (file.extension !== 'md') return false;
@@ -168,6 +172,8 @@ module.exports = class LeafSyncPlugin extends Plugin {
       new Notice(`拾页同步失败：${e.message || e}`, 8000);
     } finally {
       this.running = false;
+      // Refresh the "已同步 N 篇" count if the settings page is open.
+      if (this.settingTab?.containerEl?.isConnected) this.settingTab.display();
       if (this.again) { this.again = false; this.schedule(2000); }
     }
   }
@@ -220,9 +226,9 @@ class LeafSyncSettings extends PluginSettingTab {
     containerEl.empty();
     containerEl.createEl('p', { text: '把剪藏文件夹里的文章（连同图片）同步到你的私有 GitHub 仓库，拾页打开时会自动拉取。插件只读取笔记，不会修改或删除仓库里的任何文件。' });
     new Setting(containerEl).setName('GitHub 仓库').setDesc('格式：用户名/仓库名。请使用私有仓库。')
-      .addText(t => t.setPlaceholder('boris/shiye-library').setValue(s.repo).onChange(async v => { s.repo = v.trim(); await this.plugin.saveSettings(); }));
+      .addText(t => t.setPlaceholder('boris/shiye-library').setValue(s.repo).onChange(async v => { s.repo = v.replace(/\s+/g, ''); await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName('可写令牌').setDesc('GitHub 细粒度令牌，只授权这个仓库，权限 Contents: Read and write。')
-      .addText(t => { t.inputEl.type = 'password'; t.setPlaceholder('github_pat_…').setValue(s.token).onChange(async v => { s.token = v.trim(); await this.plugin.saveSettings(); }); });
+      .addText(t => { t.inputEl.type = 'password'; t.setPlaceholder('github_pat_…').setValue(s.token).onChange(async v => { s.token = v.replace(/\s+/g, ''); await this.plugin.saveSettings(); }); });
     new Setting(containerEl).setName('同步的文件夹').setDesc('多个用逗号分隔。Web Clipper 默认保存到 Clippings。留空表示整个仓库。')
       .addText(t => t.setPlaceholder('Clippings').setValue(s.folders).onChange(async v => { s.folders = v; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName('自动同步').setDesc('新文章保存后约 8 秒自动上传。')

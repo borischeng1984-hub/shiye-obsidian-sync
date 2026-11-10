@@ -1,7 +1,7 @@
 {
   "id": "leaf-sync",
   "name": "拾页同步",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "minAppVersion": "1.4.0",
   "description": "把剪藏的公众号文章（连同图片）同步到私有 GitHub 仓库，供拾页阅读器自动拉取。",
   "author": "拾页",
