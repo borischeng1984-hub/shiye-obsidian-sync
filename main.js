@@ -13,6 +13,12 @@ const IMAGE_EXT = /\.(png|jpe?g|gif|webp|avif|bmp|svg)$/i;
 const MIME_EXT = { 'image/jpeg': 'jpg', 'image/jpg': 'jpg', 'image/png': 'png', 'image/gif': 'gif', 'image/webp': 'webp', 'image/avif': 'avif', 'image/bmp': 'bmp', 'image/svg+xml': 'svg' };
 
 const utf8Base64 = text => arrayBufferToBase64(new TextEncoder().encode(text).buffer);
+
+/** WeChat answers non-browser fetches with a short "环境异常 / 完成验证" page instead of the article. */
+function isBlockedPage(raw) {
+  const text = raw.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, '').replace(/!\[[^\]]*\]\([^)]*\)|[#>*`_\-\s]/g, '');
+  return text.length < 600 && /环境异常|完成验证后即可继续访问|请在微信客户端打开链接|该内容已被发布者删除|此内容因违规无法查看/.test(text);
+}
 async function hex(buffer, algo = 'SHA-1') {
   const digest = await crypto.subtle.digest(algo, buffer);
   return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
@@ -158,8 +164,18 @@ module.exports = class LeafSyncPlugin extends Plugin {
     this.running = true;
     let pushed = 0, imageMiss = 0;
     try {
-      const todo = this.app.vault.getMarkdownFiles().filter(f => this.watched(f) && this.settings.synced[f.path]?.mtime !== f.stat.mtime);
-      if (!todo.length) { if (manual) new Notice('拾页同步：没有需要同步的新文章'); return; }
+      const changed = this.app.vault.getMarkdownFiles().filter(f => this.watched(f) && this.settings.synced[f.path]?.mtime !== f.stat.mtime);
+      // Never put a WeChat verification page on the shelf. Remember its mtime so it is checked again only after it is edited.
+      const todo = [], blocked = [];
+      for (const f of changed) {
+        if (isBlockedPage(await this.app.vault.cachedRead(f))) { blocked.push(f.basename); this.settings.synced[f.path] = { ...this.settings.synced[f.path], mtime: f.stat.mtime, blocked: true }; }
+        else todo.push(f);
+      }
+      if (blocked.length) {
+        await this.saveSettings();
+        new Notice(`拾页同步：「${blocked.slice(0, 2).join('」「')}」${blocked.length > 2 ? ` 等 ${blocked.length} 篇` : ''}没有拿到正文（微信验证页），未同步。请在 Safari 打开文章后重新分享到 Obsidian。`, 12000);
+      }
+      if (!todo.length) { if (manual && !blocked.length) new Notice('拾页同步：没有需要同步的新文章'); return; }
       if (manual || todo.length > 1) new Notice(`拾页同步：正在上传 ${todo.length} 篇…`);
       const gh = new GitHub(this.settings);
       for (let i = 0; i < todo.length; i += BATCH) {
@@ -233,7 +249,7 @@ class LeafSyncSettings extends PluginSettingTab {
       .addText(t => t.setPlaceholder('Clippings').setValue(s.folders).onChange(async v => { s.folders = v; await this.plugin.saveSettings(); }));
     new Setting(containerEl).setName('自动同步').setDesc('新文章保存后约 8 秒自动上传。')
       .addToggle(t => t.setValue(s.autoSync).onChange(async v => { s.autoSync = v; await this.plugin.saveSettings(); }));
-    new Setting(containerEl).setName('立即同步').setDesc(`已同步 ${Object.keys(s.synced).length} 篇。`)
+    new Setting(containerEl).setName('立即同步').setDesc((() => { const all = Object.values(s.synced), bad = all.filter(v => v.blocked).length; return `已同步 ${all.length - bad} 篇。${bad ? `${bad} 篇是微信验证页，没有同步。` : ''}`; })())
       .addButton(b => b.setButtonText('同步').setCta().onClick(() => this.plugin.sync(true)))
       .addButton(b => b.setButtonText('全部重新上传').onClick(async () => {
         if (!confirm('重新上传文件夹里的全部文章？拾页里的阅读进度和批注不受影响。')) return;
