@@ -1,0 +1,1 @@
+# shiye-obsidian-sync
