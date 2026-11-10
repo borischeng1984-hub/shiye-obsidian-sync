@@ -14,6 +14,11 @@ const MIME_EXT = { 'image/jpeg': 'jpg', 'image/jpg': 'jpg', 'image/png': 'png', 
 
 const utf8Base64 = text => arrayBufferToBase64(new TextEncoder().encode(text).buffer);
 
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+/** Repo path for the readable Markdown copy: keep Chinese, drop characters that break git trees or Windows checkouts. */
+function safeRepoPath(path) {
+  return path.split('/').map(p => p.replace(/[\u0000-\u001f?*:"<>|\\]/g, '_').replace(/[. ]+$/, '') || '_').join('/');
+}
 /** WeChat answers non-browser fetches with a short "环境异常 / 完成验证" page instead of the article. */
 function isBlockedPage(raw) {
   const text = raw.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, '').replace(/!\[[^\]]*\]\([^)]*\)|[#>*`_\-\s]/g, '');
@@ -40,11 +45,22 @@ class GitHub {
     this.owner = owner; this.repo = repo; this.branch = settings.branch || 'main'; this.token = settings.token.trim();
   }
   async call(method, path, body, accept = 'application/vnd.github+json') {
-    const res = await requestUrl({
-      url: `https://api.github.com/repos/${encodeURIComponent(this.owner)}/${encodeURIComponent(this.repo)}${path}`,
-      method, throw: false, contentType: 'application/json', body: body ? JSON.stringify(body) : undefined,
-      headers: { Authorization: `Bearer ${this.token}`, Accept: accept, 'X-GitHub-Api-Version': '2022-11-28' },
-    });
+    let res;
+    // GitHub occasionally answers 502/503/504 under load; those requests are safe to repeat.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        res = await requestUrl({
+          url: `https://api.github.com/repos/${encodeURIComponent(this.owner)}/${encodeURIComponent(this.repo)}${path}`,
+          method, throw: false, contentType: 'application/json', body: body ? JSON.stringify(body) : undefined,
+          headers: { Authorization: `Bearer ${this.token}`, Accept: accept, 'X-GitHub-Api-Version': '2022-11-28' },
+        });
+      } catch (e) {
+        if (attempt >= 2) throw new Error('连不上 GitHub，请检查网络');
+        res = { status: 599 };
+      }
+      if (res.status < 500 || attempt >= 2) break;
+      await sleep(1500 * (attempt + 1));
+    }
     if (res.status === 401) throw new Error('GitHub 令牌无效或已过期');
     if (res.status === 403) throw new Error('令牌没有这个仓库的写入权限（需要 Contents: Read and write）');
     return res;
@@ -178,11 +194,25 @@ module.exports = class LeafSyncPlugin extends Plugin {
       if (!todo.length) { if (manual && !blocked.length) new Notice('拾页同步：没有需要同步的新文章'); return; }
       if (manual || todo.length > 1) new Notice(`拾页同步：正在上传 ${todo.length} 篇…`);
       const gh = new GitHub(this.settings);
-      for (let i = 0; i < todo.length; i += BATCH) {
-        const result = await this.pushBatch(gh, todo.slice(i, i + BATCH));
-        pushed += result.pushed; imageMiss += result.imageMiss;
+      // A batch GitHub keeps rejecting is split in half, so one problem article cannot hold back the others.
+      const failed = [];
+      let lastError = null;
+      const queue = [];
+      for (let i = 0; i < todo.length; i += BATCH) queue.push(todo.slice(i, i + BATCH));
+      while (queue.length) {
+        const batch = queue.shift();
+        try {
+          const result = await this.pushBatch(gh, batch);
+          pushed += result.pushed; imageMiss += result.imageMiss;
+        } catch (e) {
+          if (/令牌|找不到仓库|连不上/.test(e.message)) throw e; // affects every batch
+          lastError = e;
+          if (batch.length > 1) { const mid = Math.ceil(batch.length / 2); queue.unshift(batch.slice(0, mid), batch.slice(mid)); }
+          else { failed.push(batch[0].basename); console.error('[拾页同步]', batch[0].path, e); }
+        }
       }
-      new Notice(`拾页同步：已同步 ${pushed} 篇${imageMiss ? `（${imageMiss} 张图片未能下载，拾页会联网加载）` : ''}`);
+      if (failed.length) new Notice(`拾页同步：已同步 ${pushed} 篇；「${failed.slice(0, 2).join('」「')}」${failed.length > 2 ? ` 等 ${failed.length} 篇` : ''}上传失败（${lastError?.message || '未知错误'}），稍后会自动重试。`, 12000);
+      else new Notice(`拾页同步：已同步 ${pushed} 篇${imageMiss ? `（${imageMiss} 张图片未能下载，拾页会联网加载）` : ''}`);
     } catch (e) {
       console.error('[拾页同步]', e);
       new Notice(`拾页同步失败：${e.message || e}`, 8000);
@@ -217,7 +247,7 @@ module.exports = class LeafSyncPlugin extends Plugin {
       const title = this.app.metadataCache.getFileCache(file)?.frontmatter?.title || file.basename;
       const article = { id, path: file.path, raw, createdAt: file.stat.ctime, updatedAt: file.stat.mtime, images };
       await put(`articles/${id}.json`, utf8Base64(JSON.stringify(article)));
-      await put(`notes/${file.path}`, utf8Base64(raw)); // readable Markdown copy for long-term keeping
+      await put(`notes/${safeRepoPath(file.path)}`, utf8Base64(raw)); // readable Markdown copy for long-term keeping
       index.articles[id] = { path: file.path, title: String(title), updatedAt: file.stat.mtime, file: `articles/${id}.json` };
       done.push([file.path, { id, mtime: file.stat.mtime }]);
     }
@@ -260,3 +290,4 @@ class LeafSyncSettings extends PluginSettingTab {
 }
 
 module.exports.imageRefs = imageRefs;
+module.exports.safeRepoPath = safeRepoPath;
