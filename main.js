@@ -7,7 +7,16 @@
 const { Plugin, PluginSettingTab, Setting, Notice, requestUrl, TFile, normalizePath, arrayBufferToBase64 } = require('obsidian');
 
 const DEFAULTS = { repo: '', branch: 'main', token: '', folders: 'Clippings', autoSync: true, synced: {} };
-const BATCH = 10;
+// Small batches: each one becomes a commit, so the first articles reach 拾页 while the rest are still uploading.
+const BATCH = 3;
+const IMAGE_CONCURRENCY = 4;
+/** Run fn over items with at most `limit` in flight. */
+async function mapLimit(items, limit, fn) {
+  const out = new Array(items.length); let next = 0;
+  const worker = async () => { while (next < items.length) { const i = next++; out[i] = await fn(items[i], i); } };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
+}
 const MAX_IMAGE = 15 * 1024 * 1024;
 const IMAGE_EXT = /\.(png|jpe?g|gif|webp|avif|bmp|svg)$/i;
 const MIME_EXT = { 'image/jpeg': 'jpg', 'image/jpg': 'jpg', 'image/png': 'png', 'image/gif': 'gif', 'image/webp': 'webp', 'image/avif': 'avif', 'image/bmp': 'bmp', 'image/svg+xml': 'svg' };
@@ -101,9 +110,9 @@ class GitHub {
     const commit = await this.call('POST', '/git/commits', { message, tree: tree.json.sha, parents: [parent] });
     if (commit.status !== 201) throw new Error(`提交失败（${commit.status}）`);
     const ref = await this.call('PATCH', `/git/refs/heads/${encodeURIComponent(this.branch)}`, { sha: commit.json.sha });
-    if (ref.status === 422) return false; // someone else moved the branch; caller retries
+    if (ref.status === 422) return null; // someone else moved the branch; caller retries
     if (ref.status !== 200) throw new Error(`更新分支失败（${ref.status}）`);
-    return true;
+    return { head: commit.json.sha, treeSha: tree.json.sha };
   }
 }
 
@@ -140,7 +149,7 @@ module.exports = class LeafSyncPlugin extends Plugin {
     return !folders.length || folders.some(f => file.path === f || file.path.startsWith(f + '/'));
   }
   // Web Clipper writes a note and may touch it again moments later; wait for it to settle.
-  schedule(delay = 8000) {
+  schedule(delay = 3000) {
     if (!this.settings.autoSync || !this.configured()) return;
     clearTimeout(this.timer); this.timer = setTimeout(() => this.sync(false), delay);
   }
@@ -176,9 +185,13 @@ module.exports = class LeafSyncPlugin extends Plugin {
 
   async sync(manual) {
     if (!this.configured()) { if (manual) new Notice('拾页同步：请先在插件设置里填写 GitHub 仓库和令牌'); return; }
-    if (this.running) { this.again = true; return; }
+    if (this.running) {
+      this.again = true;
+      if (manual) new Notice('拾页同步：正在同步中，传完会自动继续');
+      return;
+    }
     this.running = true;
-    let pushed = 0, imageMiss = 0;
+    let pushed = 0, imageMiss = 0, progress = null;
     try {
       const changed = this.app.vault.getMarkdownFiles().filter(f => this.watched(f) && this.settings.synced[f.path]?.mtime !== f.stat.mtime);
       // Never put a WeChat verification page on the shelf. Remember its mtime so it is checked again only after it is edited.
@@ -192,8 +205,12 @@ module.exports = class LeafSyncPlugin extends Plugin {
         new Notice(`拾页同步：「${blocked.slice(0, 2).join('」「')}」${blocked.length > 2 ? ` 等 ${blocked.length} 篇` : ''}没有拿到正文（微信验证页），未同步。请在 Safari 打开文章后重新分享到 Obsidian。`, 12000);
       }
       if (!todo.length) { if (manual && !blocked.length) new Notice('拾页同步：没有需要同步的新文章'); return; }
-      if (manual || todo.length > 1) new Notice(`拾页同步：正在上传 ${todo.length} 篇…`);
+      // One notice that stays up and shows progress, so a long upload never looks like nothing is happening.
+      progress = new Notice(`拾页同步：准备上传 ${todo.length} 篇…`, 0);
+      const started = new Set(); // a retried article is not counted twice
+      const onArticle = file => { started.add(file.path); progress.setMessage(`拾页同步：正在上传《${file.basename.slice(0, 24)}》（${started.size}/${todo.length}）…`); };
       const gh = new GitHub(this.settings);
+      let state = null; // repo head, tree and index, reused between batches so each batch does not re-read the whole repo
       // A batch GitHub keeps rejecting is split in half, so one problem article cannot hold back the others.
       const failed = [];
       let lastError = null;
@@ -202,21 +219,25 @@ module.exports = class LeafSyncPlugin extends Plugin {
       while (queue.length) {
         const batch = queue.shift();
         try {
-          const result = await this.pushBatch(gh, batch);
+          const result = await this.pushBatch(gh, batch, state, onArticle);
+          state = result.state;
           pushed += result.pushed; imageMiss += result.imageMiss;
         } catch (e) {
+          state = null; // re-read the repo before the next attempt
           if (/令牌|找不到仓库|连不上/.test(e.message)) throw e; // affects every batch
           lastError = e;
           if (batch.length > 1) { const mid = Math.ceil(batch.length / 2); queue.unshift(batch.slice(0, mid), batch.slice(mid)); }
           else { failed.push(batch[0].basename); console.error('[拾页同步]', batch[0].path, e); }
         }
       }
+      progress.hide(); progress = null;
       if (failed.length) new Notice(`拾页同步：已同步 ${pushed} 篇；「${failed.slice(0, 2).join('」「')}」${failed.length > 2 ? ` 等 ${failed.length} 篇` : ''}上传失败（${lastError?.message || '未知错误'}），稍后会自动重试。`, 12000);
       else new Notice(`拾页同步：已同步 ${pushed} 篇${imageMiss ? `（${imageMiss} 张图片未能下载，拾页会联网加载）` : ''}`);
     } catch (e) {
       console.error('[拾页同步]', e);
       new Notice(`拾页同步失败：${e.message || e}`, 8000);
     } finally {
+      progress?.hide();
       this.running = false;
       // Refresh the "已同步 N 篇" count if the settings page is open.
       if (this.settingTab?.containerEl?.isConnected) this.settingTab.display();
@@ -224,26 +245,41 @@ module.exports = class LeafSyncPlugin extends Plugin {
     }
   }
 
-  async pushBatch(gh, files, attempt = 0) {
+  async readState(gh) {
     const head = await gh.head();
     const { treeSha, paths } = await gh.tree(head);
     const index = (await gh.readJson('index.json')) || { format: 'leaf-sync', version: 1, articles: {} };
-    const entries = [], done = [];
+    return { head, treeSha, paths, index };
+  }
+
+  async pushBatch(gh, files, state = null, onArticle = () => {}, attempt = 0) {
+    if (!state) state = await this.readState(gh);
+    const { head, treeSha, paths } = state;
+    const index = JSON.parse(JSON.stringify(state.index)); // only adopted once the commit lands
+    const entries = [], done = [], uploading = new Map();
     let imageMiss = 0;
-    const put = async (path, base64) => { entries.push({ path, sha: await gh.blob(base64) }); paths.add(path); };
+    const put = async (path, base64) => { entries.push({ path, sha: await gh.blob(base64) }); };
+    // The same picture can appear twice; upload it once even when both copies are in flight.
+    const putAsset = (path, buf) => {
+      if (paths.has(path)) return Promise.resolve();
+      if (!uploading.has(path)) uploading.set(path, put(path, arrayBufferToBase64(buf)));
+      return uploading.get(path);
+    };
     for (const file of files) {
+      onArticle(file);
       const raw = await this.app.vault.cachedRead(file);
       if (!raw.trim()) continue; // Web Clipper may create the file before writing; a later modify retries.
       const id = this.settings.synced[file.path]?.id || (await hex(new TextEncoder().encode(file.path))).slice(0, 20);
       const images = {};
-      for (const ref of imageRefs(raw)) {
+      // Download and upload several pictures at once instead of one after another.
+      await mapLimit(imageRefs(raw), IMAGE_CONCURRENCY, async ref => {
         let img = null;
         try { img = await this.loadImage(ref, file); } catch (e) { console.warn('[拾页同步] image', ref, e); }
-        if (!img) { if (/^https?:\/\//i.test(ref)) imageMiss++; continue; }
+        if (!img) { if (/^https?:\/\//i.test(ref)) imageMiss++; return; }
         const asset = `assets/${await hex(img.buf)}.${img.ext}`;
-        if (!paths.has(asset)) await put(asset, arrayBufferToBase64(img.buf));
+        await putAsset(asset, img.buf);
         images[img.key] = asset;
-      }
+      });
       const title = this.app.metadataCache.getFileCache(file)?.frontmatter?.title || file.basename;
       const article = { id, path: file.path, raw, createdAt: file.stat.ctime, updatedAt: file.stat.mtime, images };
       await put(`articles/${id}.json`, utf8Base64(JSON.stringify(article)));
@@ -251,17 +287,18 @@ module.exports = class LeafSyncPlugin extends Plugin {
       index.articles[id] = { path: file.path, title: String(title), updatedAt: file.stat.mtime, file: `articles/${id}.json` };
       done.push([file.path, { id, mtime: file.stat.mtime }]);
     }
-    if (!done.length) return { pushed: 0, imageMiss };
+    if (!done.length) return { pushed: 0, imageMiss, state };
     index.updatedAt = Date.now();
     await put('index.json', utf8Base64(JSON.stringify(index, null, 1)));
-    const ok = await gh.commit(head, treeSha, entries, `拾页同步：${done.length} 篇`);
-    if (!ok) {
+    const landed = await gh.commit(head, treeSha, entries, `拾页同步：${done.length} 篇`);
+    if (!landed) {
       if (attempt >= 2) throw new Error('仓库正被其他设备更新，请稍后再试');
-      return this.pushBatch(gh, files, attempt + 1);
+      return this.pushBatch(gh, files, null, onArticle, attempt + 1); // branch moved: re-read and redo
     }
+    for (const e of entries) paths.add(e.path);
     for (const [path, value] of done) this.settings.synced[path] = value;
     await this.saveSettings();
-    return { pushed: done.length, imageMiss };
+    return { pushed: done.length, imageMiss, state: { head: landed.head, treeSha: landed.treeSha, paths, index } };
   }
 };
 
